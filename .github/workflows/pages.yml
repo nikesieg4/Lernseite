@@ -1,0 +1,207 @@
+# Lernseite als Vorschau auf GitHub Pages veröffentlichen
+#
+# Einrichtung (einmalig):
+#   1. Diese Datei im Repository unter  .github/workflows/pages.yml  anlegen.
+#   2. lernseite.zip ins Repository hochladen (oder den entpackten Ordner "lernseite").
+#   3. Settings → Pages → Build and deployment → Source: "GitHub Actions" wählen.
+#   Danach baut jeder Push auf main die Seite neu. Neue Lerneinheiten einfach
+#   in die ZIP (bzw. in lernseite/lessons/) legen und pushen.
+#
+# Hinweis: GitHub Pages ist reines statisches Hosting. IServ-Login, Schülerliste,
+# Datenbank und Lehrer-Übersicht gibt es erst auf dem richtigen Server (Docker).
+# Die Vorschau speichert den Fortschritt nur im Browser der Schüler/innen.
+
+name: Lernseite auf GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: ZIP entpacken bzw. Projektordner finden
+        id: src
+        run: |
+          ZIP=$(find . -path ./.git -prune -o -type f -name 'lernseite*.zip' -print | head -n 1)
+          if [ -n "$ZIP" ]; then
+            echo "Entpacke $ZIP"
+            mkdir -p _src && unzip -q -o "$ZIP" -d _src
+            SEARCH=_src
+          else
+            echo "Keine ZIP gefunden, suche entpackten Projektordner"
+            SEARCH=.
+          fi
+          LESSONS=$(find "$SEARCH" -path ./.git -prune -o -path '*/node_modules' -prune -o -type d -name lessons -print | head -n 1)
+          if [ -z "$LESSONS" ]; then
+            echo "::error::Weder lernseite.zip noch ein Ordner mit lessons/ gefunden."
+            exit 1
+          fi
+          echo "dir=$(dirname "$LESSONS")" >> "$GITHUB_OUTPUT"
+          echo "Projektordner: $(dirname "$LESSONS")"
+
+      - name: Statische Seite bauen
+        env:
+          SITE_NAME: Lernseite
+        run: |
+          cat > "$RUNNER_TEMP/build-static.mjs" <<'BUILD_SCRIPT_EOF'
+          // Baut aus dem Lernseite-Projekt eine statische Vorschau für GitHub Pages.
+          // Aufruf: node build-static.mjs <projektordner> <zielordner>
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const [src, out] = process.argv.slice(2);
+          if (!src || !out) { console.error('Aufruf: node build-static.mjs <projektordner> <zielordner>'); process.exit(1); }
+          const lessonsDir = path.join(src, 'lessons');
+          if (!fs.existsSync(lessonsDir)) { console.error(`Kein Ordner "lessons" in ${src} gefunden.`); process.exit(1); }
+
+          const SITE = process.env.SITE_NAME || 'Lernseite';
+          const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+          // Lektionen einlesen
+          const lessons = [];
+          for (const slug of fs.readdirSync(lessonsDir)) {
+            if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) continue;
+            const dir = path.join(lessonsDir, slug);
+            if (!fs.existsSync(path.join(dir, 'index.html'))) continue;
+            let meta = {};
+            try { meta = JSON.parse(fs.readFileSync(path.join(dir, 'lesson.json'), 'utf8')); }
+            catch (e) { if (e.code !== 'ENOENT') console.warn(`⚠ lesson.json in "${slug}" fehlerhaft: ${e.message}`); }
+            if (meta.hidden) continue;
+            lessons.push({
+              slug, title: meta.title || slug, subject: meta.subject || 'Allgemein',
+              description: meta.description || '', minutes: meta.minutes || null,
+              order: Number.isFinite(meta.order) ? meta.order : 1000,
+            });
+          }
+          lessons.sort((a, b) => a.subject.localeCompare(b.subject, 'de') || a.order - b.order || a.title.localeCompare(b.title, 'de'));
+
+          fs.rmSync(out, { recursive: true, force: true });
+          fs.mkdirSync(path.join(out, 'static'), { recursive: true });
+          fs.writeFileSync(path.join(out, '.nojekyll'), '');
+
+          // Stylesheet übernehmen und um Vorschau-Hinweis ergänzen
+          const cssSrc = path.join(src, 'public', 'style.css');
+          const css = fs.existsSync(cssSrc) ? fs.readFileSync(cssSrc, 'utf8') : '';
+          fs.writeFileSync(path.join(out, 'static', 'style.css'), css + `
+          .preview-note { background: var(--warn-soft); color: var(--warn); font-size: .85rem; text-align: center; padding: 6px 12px; }
+          #lesson { height: calc(100vh - 140px); }
+          `);
+
+          // Lerninhalte kopieren
+          for (const l of lessons) fs.cpSync(path.join(lessonsDir, l.slug), path.join(out, 'inhalt', l.slug), { recursive: true });
+
+          // Fortschritt im Browser (localStorage, mit Fallback falls blockiert)
+          const storeJs = `
+          var KEY = 'lernseite-erledigt';
+          function loadDone() { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { return window.__done || {}; } }
+          function saveDone(d) { window.__done = d; try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) {} }`;
+
+          const page = ({ title, root, body }) => `<!doctype html>
+          <html lang="de">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>${esc(title ? `${title} · ${SITE}` : SITE)}</title>
+          <link rel="stylesheet" href="${root}static/style.css">
+          </head>
+          <body class="bare">
+          <div class="preview-note">Vorschau ohne Anmeldung: Der Fortschritt wird nur in diesem Browser gespeichert.</div>
+          <nav class="top"><a class="brand" href="${root}">${esc(SITE)}</a></nav>
+          ${body}
+          </body>
+          </html>`;
+
+          // Übersicht
+          const bySubject = new Map();
+          for (const l of lessons) { if (!bySubject.has(l.subject)) bySubject.set(l.subject, []); bySubject.get(l.subject).push(l); }
+          const groups = [...bySubject].map(([subject, ls]) => `
+            <h2>${esc(subject)}</h2>
+            <div class="cards">${ls.map(l => `
+              <a class="card lesson" data-slug="${esc(l.slug)}" href="lektion/${esc(l.slug)}/">
+                <div class="card-top"><h3>${esc(l.title)}</h3><span class="badge ok" hidden>Erledigt</span></div>
+                ${l.description ? `<p>${esc(l.description)}</p>` : ''}
+                ${l.minutes ? `<span class="small muted">ca. ${esc(l.minutes)} Min.</span>` : ''}
+              </a>`).join('')}
+            </div>`).join('');
+
+          fs.writeFileSync(path.join(out, 'index.html'), page({ title: '', root: './', body: `
+          <main>
+            <header class="page-head">
+              <h1>Lerneinheiten</h1>
+              ${lessons.length ? `<div class="progress-line"><div class="bar"><span id="bar" style="width:0%"></span></div><span class="small muted" id="count"></span></div>` : ''}
+            </header>
+            ${groups || '<p class="muted">Noch keine Lerneinheiten im Ordner lessons/.</p>'}
+          </main>
+          <script>${storeJs}
+          var done = loadDone(), cards = document.querySelectorAll('.card[data-slug]'), n = 0;
+          cards.forEach(function (c) { if (done[c.dataset.slug]) { n++; c.classList.add('done'); c.querySelector('.badge').hidden = false; } });
+          var bar = document.getElementById('bar');
+          if (bar) { bar.style.width = Math.round(n / cards.length * 100) + '%'; document.getElementById('count').textContent = n + ' von ' + cards.length + ' Lerneinheiten erledigt'; }
+          </script>` }));
+
+          // Seite pro Lektion
+          for (const l of lessons) {
+            const dir = path.join(out, 'lektion', l.slug);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, 'index.html'), page({ title: l.title, root: '../../', body: `
+          <div class="lesson-bar">
+            <a href="../../" class="back">← Übersicht</a>
+            <h1>${esc(l.title)}</h1>
+            <button id="done" class="btn primary">Als erledigt markieren</button>
+          </div>
+          <iframe id="lesson" src="../../inhalt/${esc(l.slug)}/index.html" title="${esc(l.title)}"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"></iframe>
+          <script>${storeJs}
+          var slug = ${JSON.stringify(l.slug)}, btn = document.getElementById('done'), frame = document.getElementById('lesson');
+          function render() { var d = !!loadDone()[slug]; btn.textContent = d ? '✓ Erledigt' : 'Als erledigt markieren'; btn.className = 'btn ' + (d ? 'ok' : 'primary'); }
+          function set(v) { var d = loadDone(); if (v) d[slug] = new Date().toISOString(); else delete d[slug]; saveDone(d); render(); }
+          btn.addEventListener('click', function () { set(!loadDone()[slug]); });
+          window.addEventListener('message', function (e) {
+            if (e.source === frame.contentWindow && e.data && e.data.type === 'lernseite:erledigt') set(true);
+          });
+          render();
+          </script>` }));
+          }
+
+          console.log(`✔ ${lessons.length} Lerneinheit(en) nach ${out} gebaut: ${lessons.map(l => l.slug).join(', ')}`);
+          BUILD_SCRIPT_EOF
+          node "$RUNNER_TEMP/build-static.mjs" "${{ steps.src.outputs.dir }}" _site
+
+      - name: Seite für Pages vorbereiten
+        uses: actions/configure-pages@v5
+
+      - name: Seite hochladen
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Auf GitHub Pages veröffentlichen
+        id: deployment
+        uses: actions/deploy-pages@v4
